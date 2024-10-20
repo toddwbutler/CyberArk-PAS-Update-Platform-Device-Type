@@ -1,7 +1,7 @@
 /**
  * Title:  Update Platform Device Type
  * Author:  Todd Butler
- * TODO:  Logginf
+ * TODO:  Logging
  *
 */
 
