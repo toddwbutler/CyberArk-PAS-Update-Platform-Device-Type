@@ -1,85 +1,97 @@
-/**
- * Title:  Update Platform Device Type
- * Author:  Todd Butler
- * TODO:  Logging
- *
-*/
+<#
+.SYNOPSIS
+   Update the Device Type of a specific platform in the EPV vault with logging, log rotation, and email alerts on failure.
+.DESCRIPTION
+   This script exports a platform, modifies its device type, and re-imports it back to the vault. 
+   It includes logging with log rotation and sends email alerts on critical failures.
+#>
 
-# Set Variables
+# Variables
 $BaseURI = "https://pvwa"
 $exportPath = "C:\Temp"
+$logDirectory = Join-Path $exportPath "Logs"
+$logFile = Join-Path $logDirectory "PlatformUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$archiveLogFile = Join-Path $logDirectory "OldLogs_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
 
-#$platformID = "VMWareESX-API" # Set your platformID (not the Name) here
-$platformID = Read-Host "What is the Platform ID you want to modify?"
-#$NewDeviceTypeName = "Operating System"  # Set the new device type here
-$NewDeviceTypeName = Read-Host "What is the new Device Type name?"
+# Email Config
+$smtpServer = "smtp.yourserver.com"
+$smtpPort = 587
+$emailFrom = "admin@yourdomain.com"
+$emailTo = "alerts@yourdomain.com"
+$emailSubjectFailure = "Critical Error: Platform Update Script Failed"
+$emailBodyTemplateFailure = @"
+A critical error occurred while executing the Platform Update script.
 
-$platformIDPath = "$exportPath\$platformID"
-$platformIDFilePath = "$exportPath\$platformID.zip"
-$xmlFilePath = "$platformIDPath\Policy-$platformID.xml" # Path to the XML file
-$iniFilePath = "$platformIDPath\Policy-$platformID.ini" # Path to the INI file
+Error Details:
+{0}
+See the attached log file for more information.
+"@
 
-# Load the PSPAS module
-Import-Module pspas
+# Log Rotation Config
+$maxLogCount = 5
+$maxLogSizeMB = 2
 
-#New-PASSession -BaseURI "$BaseURI" -Credential (Get-Credential)
-New-PASSession -BaseURI "$BaseURI" -Credential (Get-Credential) -SkipCertificateCheck
-
-# Step 1: Export the platform
-Export-PasPlatform -PlatformID "$platformID" -path "$exportPath"
-
-if (-Not (Test-Path "$platformIDFilePath")) {
-    Write-Host "Export failed, file not found at "$platformIDFilePath""
-    exit 1
+function Write-Log {
+    param ([string]$message, [string]$level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$level] $message"
+    Add-Content -Path $logFile -Value $logEntry
+    Write-Host $logEntry
 }
 
-# Step 2: Extract the compressed file
-Expand-Archive -Path "$platformIDFilePath" -DestinationPath "$platformIDPath" -Force
-
-# Load the XML content
-[xml]$xmlContent = Get-Content -Path "$xmlFilePath"
-
-# Find the 'Device' element and update the 'Name' attribute
-$deviceElement = $xmlContent.Device
-if ($null -ne $deviceElement) {
-    $deviceElement.Name = "$NewDeviceTypeName"
-    $xmlContent.Save("$xmlFilePath")
-    Write-Host "Device Name updated to '$NewDeviceTypeName'."
-    Write-Host "XML file updated and saved successfully."
-}
-else {
-    Write-Host "Device Name value not found in the XML."
-    exit 1
+function Send-FailureAlert {
+    param ([string]$errorDetails)
+    $body = $emailBodyTemplateFailure -f $errorDetails
+    try {
+        Send-MailMessage -From $emailFrom -To $emailTo -Subject $emailSubjectFailure `
+                         -Body $body -SmtpServer $smtpServer -Port $smtpPort -UseSsl `
+                         -Attachments $logFile -ErrorAction Stop
+        Write-Log "Failure alert email sent."
+    } catch {
+        Write-Log "Failed to send email: $_" -Level "ERROR"
+    }
 }
 
-# Step 5: Get PolicyName from *.ini file
-# Use Get-Content to read the file and Select-String to search for 'PolicyName'
-$policyNameLine = Get-Content $iniFilePath | Select-String -Pattern "^PolicyName\s*=\s*(.*)"
-
-# Extract the value using regex and display it
-if ($policyNameLine) {
-    $policyName = $policyNameLine.Matches[0].Groups[1].Value.Trim()
-    Write-Output "PolicyName: $policyName"
-}
-else {
-    Write-Output "PolicyName not found in the file."
-}
-
-# Step 6: Compress the files back into a zip
-Compress-Archive -Path "$platformIDPath\*" -DestinationPath "$platformIDPath" -Force
-
-# Step 7 - Delete the original platform from EPV
-#$result = Get-PASPlatform | Where-Object {$_.Details.Name -eq "$policyName"}
-$result = Get-PASPlatform -Search "$policyName"
-Remove-PASPlatform -TargetPlatform -ID $result.Details.ID
-
-# Step 8: Import the updated platform back into the EPV vault
-Import-PasPlatform -ImportFile "$platformIDFilePath"
-if ($?) {
-    Write-Host "Platform imported successfully."
-}
-else {
-    Write-Host "Import failed."
+function Rotate-Logs {
+    $logFiles = Get-ChildItem -Path $logDirectory -Filter "*.log" | Sort-Object LastWriteTime -Descending
+    foreach ($log in $logFiles) {
+        if (($log.Length / 1MB) -ge $maxLogSizeMB) {
+            Compress-Archive -Path $log.FullName -DestinationPath $archiveLogFile -Force
+            Remove-Item -Path $log.FullName -Force
+        }
+    }
+    if ($logFiles.Count -ge $maxLogCount) {
+        $oldLogs = $logFiles[$maxLogCount..($logFiles.Count - 1)]
+        Compress-Archive -Path $oldLogs.FullName -DestinationPath $archiveLogFile -Force
+        $oldLogs | ForEach-Object { Remove-Item -Path $_.FullName -Force }
+    }
 }
 
-Close-PASSession
+function Update-Platform {
+    param ($platformID, $newDeviceTypeName)
+    Rotate-Logs
+    Write-Log "Platform ID: $platformID, New Device Type: $newDeviceTypeName"
+    try {
+        Import-Module pspas -ErrorAction Stop
+        $session = New-PASSession -BaseURI $BaseURI -Credential (Get-Credential) -SkipCertificateCheck
+        Export-PasPlatform -PlatformID $platformID -Path $exportPath
+        Write-Log "Platform exported."
+
+        $platformIDPath = Join-Path $exportPath $platformID
+        Expand-Archive -Path "$platformIDPath.zip" -DestinationPath $platformIDPath -Force
+        [xml]$xmlContent = Get-Content -Path (Join-Path $platformIDPath "Policy-$platformID.xml")
+        $xmlContent.Device.Name = $newDeviceTypeName
+        $xmlContent.Save((Join-Path $platformIDPath "Policy-$platformID.xml"))
+        Write-Log "Device type updated."
+
+        Compress-Archive -Path "$platformIDPath\*" -DestinationPath "$platformIDPath.zip" -Force
+        Remove-PASPlatform -ID (Get-PASPlatform -Search $newDeviceTypeName).Details.ID
+        Import-PasPlatform -ImportFile "$platformIDPath.zip"
+        Write-Log "Platform updated successfully."
+    } catch {
+        Write-Log "Error: $_" -Level "ERROR"
+        Send-FailureAlert $_
+    } finally {
+        Close-PASSession
+    }
+}
